@@ -1,0 +1,382 @@
+<script type="text/javascript">
+        var gk_isXlsx = false;
+        var gk_xlsxFileLookup = {};
+        var gk_fileData = {};
+        function filledCell(cell) {
+          return cell !== '' && cell != null;
+        }
+        function loadFileData(filename) {
+        if (gk_isXlsx && gk_xlsxFileLookup[filename]) {
+            try {
+                var workbook = XLSX.read(gk_fileData[filename], { type: 'base64' });
+                var firstSheetName = workbook.SheetNames[0];
+                var worksheet = workbook.Sheets[firstSheetName];
+
+                // Convert sheet to JSON to filter blank rows
+                var jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1, blankrows: false, defval: '' });
+                // Filter out blank rows (rows where all cells are empty, null, or undefined)
+                var filteredData = jsonData.filter(row => row.some(filledCell));
+
+                // Heuristic to find the header row by ignoring rows with fewer filled cells than the next row
+                var headerRowIndex = filteredData.findIndex((row, index) =>
+                  row.filter(filledCell).length >= filteredData[index + 1]?.filter(filledCell).length
+                );
+                // Fallback
+                if (headerRowIndex === -1 || headerRowIndex > 25) {
+                  headerRowIndex = 0;
+                }
+
+                // Convert filtered JSON back to CSV
+                var csv = XLSX.utils.aoa_to_sheet(filteredData.slice(headerRowIndex)); // Create a new sheet from filtered array of arrays
+                csv = XLSX.utils.sheet_to_csv(csv, { header: 1 });
+                return csv;
+            } catch (e) {
+                console.error(e);
+                return "";
+            }
+        }
+        return gk_fileData[filename] || "";
+        }
+        </script><!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Grit Web: Habit Tracker</title>
+  <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.development.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.22.5/babel.min.js" crossorigin></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/uuid@9.0.1/dist/umd/uuidv4.min.js" crossorigin></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    .container { max-width: 1200px; margin: 0 auto; padding: 1rem; }
+    .error-boundary { color: red; padding: 1rem; border: 1px solid red; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    // Firebase Configuration
+    // IMPORTANT: Replace with your Firebase project credentials
+    // 1. Go to https://console.firebase.google.com/
+    // 2. Create a new project
+    // 3. Enable Email/Password Authentication and Firestore Database
+    // 4. Copy your Firebase config from Project Settings
+    // For testing, you can use this mock config (replace with real values for production)
+    const firebaseConfig = {
+      apiKey: "AIzaSyDUMMYKEY1234567890",
+      authDomain: "grit-web-demo.firebaseapp.com",
+      projectId: "grit-web-demo",
+      storageBucket: "grit-web-demo.appspot.com",
+      messagingSenderId: "1234567890",
+      appId: "1:1234567890:web:abcdef123456"
+    };
+
+    // Initialize Firebase with error handling
+    let auth, db;
+    try {
+      const app = firebase.initializeApp(firebaseConfig);
+      auth = firebase.auth();
+      db = firebase.firestore();
+      console.log("Firebase initialized successfully");
+    } catch (error) {
+      console.error("Firebase initialization failed:", error);
+      alert("Failed to initialize Firebase. Please check your configuration and network.");
+    }
+
+    // Request Notification Permission
+    if (Notification.permission !== 'granted') {
+      Notification.requestPermission().then(permission => {
+        console.log("Notification permission:", permission);
+      }).catch(error => {
+        console.error("Notification permission error:", error);
+      });
+    }
+
+    // Error Boundary Component
+    class ErrorBoundary extends React.Component {
+      state = { hasError: false, error: null };
+      static getDerivedStateFromError(error) {
+        console.error("ErrorBoundary caught:", error);
+        return { hasError: true, error };
+      }
+      render() {
+        if (this.state.hasError) {
+          return (
+            <div className="error-boundary">
+              <h2>Something went wrong.</h2>
+              <p>{this.state.error?.message || "Unknown script error. Check console for details."}</p>
+            </div>
+          );
+        }
+        return this.props.children;
+      }
+    }
+
+    // Habit Tracker Component
+    function HabitTracker() {
+      const [user, setUser] = React.useState(null);
+      const [habits, setHabits] = React.useState([]);
+      const [newHabit, setNewHabit] = React.useState({ name: '', goal: 1, unit: 'times', group: 'General', color: '#3B82F6' });
+      const [stats, setStats] = React.useState({});
+
+      // Authentication State
+      React.useEffect(() => {
+        if (!auth) {
+          console.error("Auth not initialized");
+          return;
+        }
+        const unsubscribe = auth.onAuthStateChanged((user) => {
+          setUser(user);
+          if (user) {
+            console.log("User logged in:", user.uid);
+            loadHabits(user.uid);
+          } else {
+            console.log("No user logged in");
+            setHabits([]);
+          }
+        }, (error) => {
+          console.error("Auth state error:", error);
+        });
+        return () => unsubscribe();
+      }, []);
+
+      // Load Habits from Firestore
+      const loadHabits = async (uid) => {
+        if (!db) {
+          console.error("Firestore not initialized");
+          return;
+        }
+        try {
+          const snapshot = await db.collection('habits').where('userId', '==', uid).get();
+          const loadedHabits = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+          setHabits(loadedHabits);
+          updateStats(loadedHabits);
+          console.log("Habits loaded:", loadedHabits);
+        } catch (error) {
+          console.error("Error loading habits:", error);
+        }
+      };
+
+      // Add New Habit
+      const addHabit = async (e) => {
+        e.preventDefault();
+        if (!user) {
+          alert('Please log in to add habits.');
+          return;
+        }
+        if (!db) {
+          console.error("Firestore not initialized");
+          return;
+        }
+        try {
+          const habit = {
+            ...newHabit,
+            id: uuidv4(),
+            userId: user.uid,
+            progress: [],
+            createdAt: new Date().toISOString()
+          };
+          await db.collection('habits').doc(habit.id).set(habit);
+          setHabits([...habits, habit]);
+          setNewHabit({ name: '', goal: 1, unit: 'times', group: 'General', color: '#3B82F6' });
+          updateStats([...habits, habit]);
+          scheduleNotification(habit);
+          console.log("Habit added:", habit);
+        } catch (error) {
+          console.error("Error adding habit:", error);
+        }
+      };
+
+      // Mark Habit as Complete
+      const completeHabit = async (habitId) => {
+        if (!db) {
+          console.error("Firestore not initialized");
+          return;
+        }
+        try {
+          const habit = habits.find(h => h.id === habitId);
+          const today = new Date().toISOString().split('T')[0];
+          const updatedProgress = [...(habit.progress || []), { date: today, completed: true }];
+          await db.collection('habits').doc(habitId).update({ progress: updatedProgress });
+          const updatedHabits = habits.map(h => h.id === habitId ? { ...h, progress: updatedProgress } : h);
+          setHabits(updatedHabits);
+          updateStats(updatedHabits);
+          console.log("Habit департамент completed:", habitId);
+        } catch (error) {
+          console.error("Error completing habit:", error);
+        }
+      };
+
+      // Update Statistics (Simplified without Chart.js)
+      const updateStats = (habits) => {
+        const stats = habits.reduce((acc, habit) => {
+          const completions = habit.progress?.filter(p => p.completed).length || 0;
+          const successRate = habit.goal > 0 ? (completions / habit.goal) * 100 : 0;
+          acc[habit.id] = { name: habit.name, completions, successRate: successRate.toFixed(2) };
+          return acc;
+        }, {});
+        setStats(stats);
+        console.log("Stats updated:", stats);
+      };
+
+      // Schedule Notification
+      const scheduleNotification = (habit) => {
+        if (Notification.permission === 'granted') {
+          setTimeout(() => {
+            try {
+              new Notification(`Time to work on ${habit.name}!`, {
+                body: `Goal: ${habit.goal} ${habit.unit}`,
+                icon: '/icon.png'
+              });
+              console.log("Notification scheduled for:", habit.name);
+            } catch (error) {
+              console.error("Notification error:", error);
+            }
+          }, 5000); // 5 seconds for demo
+        } else {
+          console.warn("Notifications not permitted");
+        }
+      };
+
+      // Login/Logout
+      const login = async () => {
+        if (!auth) {
+          console.error("Auth not initialized");
+          return;
+        }
+        try {
+          await auth.signInWithEmailAndPassword('test@example.com', 'password123');
+          console.log("Login successful");
+        } catch (error) {
+          console.error("Login failed:", error);
+          alert('Login failed. Please try again.');
+        }
+      };
+      const logout = async () => {
+        if (!auth) {
+          console.error("Auth not initialized");
+          return;
+        }
+        try {
+          await auth.signOut();
+          console.log("Logout successful");
+        } catch (error) {
+          console.error("Logout failed:", error);
+        }
+      };
+
+      // Render
+      return (
+        <div className="container mx-auto p-4">
+          <header className="flex justify-between items-center mb-4">
+            <h1 className="text-3xl font-bold">Grit Web: Habit Tracker</h1>
+            {user ? (
+              <button onClick={logout} className="bg-red-500 text-white px-4 py-2 rounded">Logout</button>
+            ) : (
+              <button onClick={login} className="bg-blue-500 text-white px-4 py-2 rounded">Login</button>
+            )}
+          </header>
+
+          {/* Add Habit Form */}
+          <form onSubmit={addHabit} className="mb-8 p-4 bg-gray-100 rounded shadow">
+            <h2 className="text-xl font-semibold mb-4">Add New Habit</h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <input
+                type="text"
+                placeholder="Habit Name"
+                value={newHabit.name}
+                onChange={(e) => setNewHabit({ ...newHabit, name: e.target.value })}
+                className="p-2 border rounded"
+                required
+              />
+              <input
+                type="number"
+                placeholder="Goal"
+                value={newHabit.goal}
+                onChange={(e) => setNewHabit({ ...newHabit, goal: parseInt(e.target.value) })}
+                className="p-2 border rounded"
+                min="1"
+                required
+              />
+              <select
+                value={newHabit.unit}
+                onChange={(e) => setNewHabit({ ...newHabit, unit: e.target.value })}
+                className="p-2 border rounded"
+              >
+                <option value="times">Times</option>
+                <option value="minutes">Minutes</option>
+                <option value="pages">Pages</option>
+              </select>
+              <input
+                type="text"
+                placeholder="Group"
+                value={newHabit.group}
+                onChange={(e) => setNewHabit({ ...newHabit, group: e.target.value })}
+                className="p-2 border rounded"
+              />
+              <input
+                type="color"
+                value={newHabit.color}
+                onChange={(e) => setNewHabit({ ...newHabit, color: e.target.value })}
+                className="p-2 border rounded"
+              />
+            </div>
+            <button type="submit" className="mt-4 bg-blue-500 text-white px-4 py-2 rounded">Add Habit</button>
+          </form>
+
+          {/* Habit List */}
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-8">
+            {habits.map(habit => (
+              <div key={habit.id} className="p-4 bg-white rounded shadow" style={{ borderLeft: `4px solid ${habit.color}` }}>
+                <h3 className="text-lg font-semibold">{habit.name}</h3>
+                <p>Goal: {habit.goal} {habit.unit}</p>
+                <p>Group: {habit.group}</p>
+                <button
+                  onClick={() => completeHabit(habit.id)}
+                  className="mt-2 bg-green-500 text-white px-4 py-2 rounded"
+                >
+                  Mark Complete
+                </button>
+              </div>
+            ))}
+          </div>
+
+          {/* Statistics (Simplified) */}
+          <div className="p-4 bg-white rounded shadow">
+            <h2 className="text-xl font-semibold mb-4">Statistics</h2>
+            {Object.values(stats).map(stat => (
+              <div key={stat.name} className="mb-2">
+                <p>{stat.name}: {stat.completions} completions, {stat.successRate}% success rate</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // Render App with Error Boundary
+    try {
+      ReactDOM.render(
+        <ErrorBoundary>
+          <HabitTracker />
+        </ErrorBoundary>,
+        document.getElementById('root')
+      );
+      console.log("App rendered successfully");
+    } catch (error) {
+      console.error("Error rendering app:", error);
+      document.getElementById('root').innerHTML = `
+        <div style="color: red; padding: 1rem;">
+          <h2>Failed to render application</h2>
+          <p>${error.message}</p>
+        </div>
+      `;
+    }
+  </script>
+</body>
+</html>
